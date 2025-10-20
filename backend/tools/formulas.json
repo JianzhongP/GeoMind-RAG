@@ -1,0 +1,37 @@
+[
+  {
+    "page": 8,
+    "id": "公式8-1",
+    "latex": "L = DN \\times gain + bias",
+    "type": "display",
+    "context": "根据观测结果和标准板的观测结果，通过公式（1）和（2）计算得到地表反射率。其中，多光谱相机的观测波段至少包括蓝、绿、红、近红外，波段宽度和中心波长根据常用待验证遥感产品实际情况而定；高光谱成像仪的光谱波段观测范围至少为400 nm~1000 nm，光谱分辨率优于3 nm。"
+  },
+  {
+    "page": 8,
+    "id": "公式8-2",
+    "latex": "L——目标地物的辐射亮度，W/(m^2\\cdot sr\\cdot \\mu m);\\\\DN——观测获得的灰度值;\\\\gain——仪器的增益;",
+    "type": "inline",
+    "context": "式中：$L$——目标地物的辐射亮度，W/(m²·sr·μm)；\\n$DN$——观测获得的灰度值；\\n$gain$——仪器的增益；"
+  },
+  {
+    "page": 9,
+    "id": "公式9-1",
+    "latex": "\\rho = \\frac{L \\times \\rho_0}{L_0}",
+    "type": "display",
+    "context": "bias——仪器的偏置。"
+  },
+  {
+    "page": 9,
+    "id": "公式9-2",
+    "latex": "LST = \\left\\{ \\frac{1}{\\sigma} \\left[ R_{up} - (1 - \\varepsilon) R_{down} \\right] \\right\\}^{\\frac{1}{4}}",
+    "type": "display",
+    "context": "地表温度按照公式（3）进行计算。"
+  },
+  {
+    "page": 10,
+    "id": "公式10-1",
+    "latex": "FPAR = [L - L_{cu} - (L_{cd} - L_{so})] / L",
+    "type": "display",
+    "context": "按公式（4）计算得到 FPAR。"
+  }
+]

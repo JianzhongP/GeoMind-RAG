@@ -1,0 +1,1543 @@
+# 阿秋
+# 2025/10/17 14:30
+from datetime import datetime
+import json
+import os
+import time
+import uuid
+from pathlib import Path
+from typing import Dict, Any, Optional, List
+
+import uvicorn
+from fastapi import UploadFile, Request, HTTPException, FastAPI, File
+from fastapi.responses import FileResponse
+# 流式输出
+from fastapi.responses import StreamingResponse
+
+from dotenv import load_dotenv
+from langchain_openai import OpenAI
+from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
+
+from backend.modal_analyzer.vlm_analyzer import SimpleVLMAnalyzer, ImageType
+from backend.tools.PDF_Extraction import PDFExtractionService
+
+from embedding_model.qwen_embedding import QWENEmbedding
+from langchain_chroma import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.docstore.document import Document
+
+from logger.logger import log_request
+load_dotenv(override=True)
+
+"-----------配置日志记录-----------"
+import logging
+import sys
+import io
+# emoji 或特殊符号正常显示
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+# 设置日志的路径
+log_dir = Path("./logs")
+log_dir.mkdir(parents=True, exist_ok=True)
+log_files = log_dir / "multimodal_rag.log" # 这里重载了'/'运算符，成为了连接符
+# 创建日志对象
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+# 定义日志输出格式
+formatter = logging.Formatter(
+    fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+# 设置控制台输出
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_handler.setFormatter(formatter)
+# 输出到文件
+file_handler = logging.FileHandler(log_files)
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(formatter)
+# 将两个handler加入logger
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
+
+"--------------------定义API接口的数据管理类--------------------"
+class VLMModel:
+    """视觉模型管理"""
+    GPT_4O = "gpt-4o"
+    QWEN_VL = "qwen-vl"
+    INTERN_VL = "intern-vl"
+
+class RetrievalStrategy:
+    """检索策略管理"""
+    VECTOR = "vector" # 向量检索
+    HYBRID = "hybrid" # 混合检索（向量+关键字）
+    TWO_STAGE = "two-stage" # 两阶段检索（先粗捡再精排）
+
+class SearchRequest(BaseModel):
+    """搜索请求"""
+    query: str
+    model: str = VLMModel.QWEN_VL
+    strategy: str = RetrievalStrategy.HYBRID
+    topK: int = 10
+    minSimilarity: float = 0.0  # 最小相似度阈值（0-1），默认0.0（不过滤）
+    filters: Optional[Dict[str, Any]] = None
+
+class SearchResult(BaseModel):
+    """搜索结果"""
+    id: str
+    fileName: str
+    filePath: str
+    fileType: str
+    similarity: float
+    page: Optional[str] = None
+    date: str
+    snippet: str
+    citationNumber: int
+    thumbnailType: str
+    thumbnailUrl: Optional[str] = None
+    previewUrl: Optional[str] = None
+    version: str
+    structuredData: List[Dict[str, str]]
+
+class SearchResponse(BaseModel):
+    """搜索响应"""
+    results: List[SearchResult]
+    totalCount: int
+    queryTime: float
+    model: str
+    strategy: str
+
+class UploadResponse(BaseModel):
+    """上传响应"""
+    success: bool
+    fileId: str
+    fileName: str
+    message: Optional[str] = None
+    detectedImageType: Optional[str] = None  # 检测到的图片类型
+
+class FollowUpQuestionRequest(BaseModel):
+    """追问请求"""
+    documentId: str
+    question: str
+    model: str = VLMModel.GPT_4O
+
+class FollowUpQuestionResponse(BaseModel):
+    """追问响应"""
+    answer: str
+    citations: List[int]
+    confidence: float
+
+class IntelligentQARequest(BaseModel):
+    """智能问答请求"""
+    question: str
+    filters: Optional[Dict[str, Any]] = None  # 可选的过滤条件
+    top_k: int = 3
+
+class IntelligentQAResponse(BaseModel):
+    """智能问答响应"""
+    answer: str
+    sources: List[Dict[str, Any]]
+    confidence: float
+    query_type: str  # exact_query, filter_query, general_query
+
+"----------------向量数据库管理器------------------"
+class VectorStoreManager:
+    "使用 Chroma DB "
+
+    def __init__(self, db_path: str ="./chroma_db"):
+        self.db_path = db_path
+        os.makedirs(self.db_path, exist_ok=True)
+
+        # 根据所选 嵌入模型 初始化
+        logger.info("初始化嵌入模型 ...")
+        self.embeddingm_type = os.getenv("EMBEDDING_QWEN", "EMBEDDING_HF")
+
+        # 判断嵌入模型的类型
+        if self.embeddingm_type == "qwen":
+            logger.info("使用的是 通义千问 大模型：")
+            self.embeddings_model = QWENEmbedding(
+                model=os.getenv("QWEN_EMBEDDING_MODEL_NAME"),
+                api_key=os.getenv("QWEN_API_KEY"),
+                base_url=os.getenv("QWEN_BASE_URL"),
+                dimensions=int(os.getenv("QWEN_DIMENSIONS", "1024")),
+            )
+        else:
+            # 使用 HuggingFace Embedding（默认，离线可用）
+            print("  使用 HuggingFace Embedding")
+            model_name = os.getenv("EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+            self.embeddings_model = HuggingFaceEmbeddings(
+                model_name=model_name,
+                model_kwargs={'device': 'cpu'},
+                encode_kwargs={'normalize_embeddings': True}
+            )
+
+        # 初始化 chorma db 数据库
+        self.vector_store = Chroma(
+            persist_directory=self.db_path,
+            embedding_function=self.embeddings_model,
+            collection_name="multimodalRAG"
+        )
+
+        # 创建文本分割器，约定几个参数
+        chunk_size = int(os.getenv("CHUNK_SIZE", 512))
+        chunk_overlap = int(os.getenv("CHUNK_OVERLAP", 128))
+        self.splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=["\n\n", "\n", "。", "！", "？", "；", "，", " ", ""]
+        )
+
+        # 记录日志
+        logger.info(f"  向量数据库初始化完成")
+        logger.info(f"  Embedding类型: {self.embeddingm_type}")
+        logger.info(f"  分块大小: {chunk_size}, 重叠: {chunk_overlap}")
+
+    async def add_document(self,
+                           file_type: str,
+                           file_name: str,
+                           file_id: str,
+                           content: str,
+                           metadata: Dict[str, Any],) -> int:
+        """添加文档到向量库"""
+        print(f"\n📥 添加文档到向量库: {file_name}")
+
+        # 分割文本
+        chunks = self.splitter.split_text(content)
+        logger.info(f"  分割为 {len(chunks)} 个文本块")
+
+        # 创建 Document 对象
+        documents = []
+        for i, chunk in enumerate(chunks):
+            doc_metadata = {
+                "file_id": file_id,
+                "file_name": file_name,
+                "file_type": file_type,
+                "chunk_id": i,
+                "total_chunks": len(chunks),
+                "upload_date": datetime.now().isoformat(),
+                **metadata
+            }
+
+            documents.append(Document(
+                page_content=chunk,
+                metadata=doc_metadata
+            ))
+
+        # 添加到向量库
+        ids = [f"{file_id}_chunk_{i}" for i in range(len(documents))]
+        self.vector_store.add_documents(documents, ids=ids)
+
+        logger.info(f"✓ 文档已添加到向量库，共 {len(documents)} 个块")
+        return len(documents)
+
+    async def search(
+            self,
+            query: str,
+            top_k: int = 10,
+            file_type_filter: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """向量检索"""
+        print(f"\n🔍 执行向量检索: {query[:50]}...")
+
+        # 构建过滤器
+        where_filter = {}
+        if file_type_filter:
+            where_filter["file_type"] = file_type_filter
+
+        # 执行检索
+        if where_filter:
+            results = self.vector_store.similarity_search_with_score(
+                query,
+                k=top_k,
+                filter=where_filter
+            )
+        else:
+            results = self.vector_store.similarity_search_with_score(
+                query,
+                k=top_k
+            )
+
+        # 格式化结果
+        formatted_results = []
+        for doc, score in results:
+            # ChromaDB 使用 L2 (欧几里得距离) 或余弦距离
+            # L2 距离范围可能很大，余弦距离范围是 [0, 2]
+            #
+            # 方案1：使用倒数归一化（适用于各种距离度量）
+            # similarity = 1 / (1 + distance)
+            #
+            # 方案2：余弦距离转相似度
+            # similarity = 1 - (distance / 2)
+            #
+            # 我们使用方案1，因为它对任何距离都有效
+            # 注意，这里还可以添加缩放因子进入
+            similarity = 1.0 / (1.0 + score)  # 距离越小，相似度越高
+
+            formatted_results.append({
+                "content": doc.page_content,
+                "metadata": doc.metadata,
+                "similarity": float(similarity),
+                "distance": float(score)  # 保留原始距离用于调试
+            })
+
+        logger.info(f"  找到 {len(formatted_results)} 个相关结果")
+
+        # 【调试】显示距离和相似度的对应关系
+        if formatted_results:
+            logger.info(
+                f"  距离范围: {min(r['distance'] for r in formatted_results):.4f} ~ {max(r['distance'] for r in formatted_results):.4f}")
+            logger.info(
+                f"  相似度范围: {min(r['similarity'] for r in formatted_results):.4f} ~ {max(r['similarity'] for r in formatted_results):.4f}")
+
+        return formatted_results
+
+
+"-------------初始化主程序类---------------"
+class MultiModalRAGService:
+    def __init__(self, ):
+        # 配置模型参数
+        self.model_url = os.getenv("QWEN_BASE_URL")
+        self.infermodel_api_key = os.getenv('QWEN_API_KEY')
+        self.embeddingmodel_name = os.getenv('QWEN_EMBEDDING_MODEL_NAME')
+        self.infermodel_name = os.getenv('QWEN_MULTIMODAL_MODAL_NAME')
+
+        # 初始化各个组件
+        self.pdf_service = PDFExtractionService()
+        self.vector_manager = VectorStoreManager()
+
+        # 初始化调用的模型
+        self.vlm_analyzer = SimpleVLMAnalyzer(
+            model_url= self.model_url,
+            api_key=self.infermodel_api_key,
+            model_name=self.infermodel_name,
+        )
+        # 设置文件存储目录
+        self.load_dir = Path("./files_load")
+        self.load_dir.mkdir(parents=True, exist_ok=True)
+
+        # 预览图存储地址
+        self.preview_dir = Path("./preview")
+        self.preview_dir.mkdir(parents=True, exist_ok=True)
+
+        print("服务端初始化完成")
+        print('\n'+'-'*50)
+
+    def _format_extracted_info_to_natural_language(self, info: Dict[str, Any], image_type=None) -> str:
+        """将结构化信息转换为自然语言"""
+        if not info:
+            return ""
+
+        lines = []
+
+        # 基本元信息
+        if "drawing_title" in info:
+            lines.append(f"图纸名称：{info['drawing_title']}")
+        if "source" in info:
+            lines.append(f"数据源：{info['source']}")
+        if "acquisition_date" in info:
+            lines.append(f"采集时间：{info['acquisition_date']}")
+        if "crs" in info:
+            lines.append(f"投影坐标系：{info['crs']}")
+        if "resolution_m" in info:
+            lines.append(f"分辨率：{info['resolution_m']} 米/像元")
+
+        # 不同图像类型的特定信息组装
+        if image_type == ImageType.Classification:
+            # 分类图信息
+            if "area_stats_km2" in info:
+                area_lines = []
+                for cls, stats in info["area_stats_km2"].items():
+                    area_lines.append(
+                        f"- {cls}：像元数 {stats.get('pixel_count', 0)}，面积 {stats.get('area_km2', 0):.2f} km²"
+                    )
+                lines.append("\n类别面积统计：\n" + "\n".join(area_lines))
+
+            if "spatial_summary" in info:
+                lines.append("\n空间分布摘要：")
+                for item in info["spatial_summary"]:
+                    lines.append(
+                        f"- {item.get('class')} 类主要集中在 {', '.join(item.get('major_clusters', []))}，"
+                        f"质心经纬度 ({item.get('centroid_lon')}, {item.get('centroid_lat')})"
+                    )
+
+            if "notable_findings" in info:
+                lines.append("\n显著发现：")
+                for finding in info["notable_findings"]:
+                    lines.append(f"- {finding}")
+
+        elif image_type == ImageType.Detection:
+            if "detections" in info:
+                lines.append("\n检测目标清单：")
+                for det in info["detections"]:
+                    lines.append(
+                        f"- ID {det['id']}：类别 {det['class']}，置信度 {det['confidence']:.2f}，"
+                        f"面积 {det.get('area_m2', 0):.1f} m²，质心 {det.get('centroid_lonlat', 'N/A')}"
+                    )
+
+            if "changes" in info:
+                lines.append("\n变化检测：")
+                for chg in info["changes"]:
+                    lines.append(
+                        f"- {chg['type']} 类别 {chg['class']}，变化率 {chg.get('area_change_pct', 0):.1f}%，"
+                        f"位置 {chg.get('location', '未知')}"
+                    )
+
+        elif image_type == ImageType.Technology_map:
+            if "modules" in info:
+                lines.append("\n模块组成：")
+                for m in info["modules"]:
+                    lines.append(f"- {m['name']}：{m['description']}")
+
+            if "flow_sequence" in info:
+                lines.append("\n流程步骤：")
+                for step in info["flow_sequence"]:
+                    lines.append(f"步骤 {step['step']}：{step['module']} → {', '.join(step.get('next', []))}")
+
+            if "potential_bottlenecks" in info:
+                lines.append("\n潜在瓶颈：")
+                lines.extend(["- " + b for b in info["potential_bottlenecks"]])
+
+        elif image_type == ImageType.Technical_doc:
+            if "meta" in info:
+                meta = info["meta"]
+                lines.append(
+                    f"文档《{meta.get('title', '未命名')}》，版本 {meta.get('version', '未知')}，"
+                    f"作者 {meta.get('author', '未知')}，页数 {meta.get('pages', '?')}"
+                )
+
+            if "chapters" in info:
+                lines.append("\n章节摘要：")
+                for ch in info["chapters"]:
+                    lines.append(f"- {ch['chapter']}：{ch['summary']}")
+
+            if "technical_parameters" in info:
+                lines.append("\n关键参数：")
+                for p in info["technical_parameters"]:
+                    lines.append(f"- {p['name']} = {p['value']} {p['unit']}（第 {p['page']} 页）")
+
+        return "\n".join(lines)
+
+    async def _detect_image_type(
+            self,
+            image_path: Path,
+            user_specified_type: Optional[str] = None
+    ) -> str:
+        """
+        智能检测图片类型
+
+        Args:
+            image_path: 图片路径
+            user_specified_type: 用户指定的类型（如果有）
+
+        Returns:
+            ImageType 枚举值
+        """
+        # 如果用户指定了类型，直接使用
+        if user_specified_type:
+            logger.info(f"  使用用户指定的图片类型: {user_specified_type}")
+            return user_specified_type
+
+        logger.info(f"🔍 智能检测图片类型...")
+
+        # 使用 VLM 进行智能识别
+        try:
+            # 给VLM智能检测的提示词
+            detection_prompt = """
+            请快速识别这张图片的类型，从以下选项中选择最合适的一个：
+
+            1. **Classification** - 遥感分类图像（包含分类目标、分布情况）
+            2. **Detection** - 目标检测图（包含目标框、目标类别）
+            3. **Technology_map** - 系统架构图（包含模块、组件、数据流）
+            4. **Technical_doc** - 工业技术档案文件（包含表格、参数、要求）
+            
+            **判断依据：**
+            - 如果有大量分类像素点、分类类别、遥感图像 → Classification
+            - 如果有目标框、类别信息、遥感图像 → Detection
+            - 如果有流程图、架构图、组件关系、箭头连接 → Technology_map
+            - 如果有表格、基本流程、量化指标 → Technical_doc
+            
+            **请直接返回{{Classification、Detection、Technology_map、Technical_doc}}其中之一，不要有其他内容。**
+            """
+
+            # 使用较小的 token 限制快速判断
+            from PIL import Image
+            image = Image.open(image_path)
+            image_base64 = self.vlm_analyzer.image_to_base64(image, max_size=1000)
+
+            # 调用 VLM API
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": detection_prompt
+                        }
+                    ]
+                }
+            ]
+
+            response = await self.vlm_analyzer.openai_client.chat.completions.create(
+                model=self.infermodel_name,
+                messages=messages,
+                max_tokens=50,
+                temperature=0.0
+            )
+
+            detected_type = response.choices[0].message.content.strip().lower()
+
+            # 验证返回的类型
+            valid_types = [ImageType.Classification, ImageType.Detection, ImageType.Technology_map, ImageType.Technical_doc]
+            if detected_type in valid_types:
+                logger.info(f"  ✓ 智能识别结果: {detected_type}")
+                return detected_type
+            else:
+                logger.warning(f"  ⚠️ 无法识别类型: {detected_type}，使用默认类型: technology_map")
+                return ImageType.Technology_map
+
+        except Exception as e:
+            logger.warning(f"  ⚠️ 智能识别失败: {e}，使用默认类型: technology_map")
+            return ImageType.Technology_map
+
+    def _generate_pdf_thumbnail(self, pdf_path: Path, file_id: str) -> Path:
+        """生成PDF首页缩略图"""
+        import fitz # PDF 处理库
+        from PIL import Image
+        import io
+
+        try:
+            # 打开PDF
+            doc = fitz.open(str(pdf_path))
+
+            # 获取第一页
+            page = doc[0]
+
+            # 渲染为图像（提高分辨率以获得更清晰的缩略图）
+            mat = fitz.Matrix(2.0, 2.0)  # 2倍缩放
+            pix = page.get_pixmap(matrix=mat)
+
+            # 转换为PIL Image
+            img_data = pix.tobytes("png")
+            img = Image.open(io.BytesIO(img_data))
+
+            # 创建缩略图（保持宽高比）
+            img.thumbnail((400, 400), Image.Resampling.LANCZOS)
+
+            # 保存缩略图
+            thumbnail_path = self.preview_dir / f"{file_id}_thumb.png"
+            img.save(thumbnail_path, "PNG", optimize=True)
+
+            doc.close()
+
+            logger.info(f"  PDF缩略图已生成: {thumbnail_path}")
+            return thumbnail_path
+
+        except Exception as e:
+            logger.error(f"生成PDF缩略图失败: {e}")
+            return None
+
+    async def _analyze_pdf_images(
+            self,
+            pdf_path: Path,
+            extraction_result: Dict[str, Any]
+    ) -> str:
+        """
+        分析PDF中的图片页面，使用VLM提取信息
+
+        Args:
+            pdf_path: PDF文件路径
+            extraction_result: PDF提取结果
+
+        Returns:
+            图片分析的文本内容
+        """
+        import fitz
+        from PIL import Image
+        import io
+
+        logger.info("  开始分析PDF中的图片页面...")
+
+        image_analysis_results = []
+
+        try:
+            doc = fitz.open(str(pdf_path))
+
+            # 遍历每一页
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+
+                # 获取页面图片
+                image_list = page.get_images(full=True)
+
+                # 如果这一页有图片，或者这一页主要是图片（文本很少）
+                text_length = len(page.get_text().strip())
+
+                # 判断是否为图片页：有图片且文本少于100字符
+                if image_list and text_length < 100:
+                    logger.info(f"  发现图片页: 第 {page_num + 1} 页")
+
+                    # 渲染整页为图片
+                    mat = fitz.Matrix(2.0, 2.0)  # 2倍缩放
+                    pix = page.get_pixmap(matrix=mat)
+
+                    # 转换为PIL Image
+                    img_data = pix.tobytes("png")
+                    image = Image.open(io.BytesIO(img_data))
+
+                    # 智能检测图片类型
+                    # 先保存临时文件用于检测
+                    temp_path = self.load_dir / f"temp_page_{page_num}.png"
+                    image.save(temp_path, "PNG")
+
+                    detected_type = await self._detect_image_type(temp_path)
+
+                    # 使用 VLM 分析
+                    analysis_result = await self.vlm_analyzer.analyze_image(
+                        image,
+                        question=f"这是PDF文档第{page_num + 1}页的内容，请详细描述这张图的所有信息。",
+                        image_type=detected_type
+                    )
+
+                    # 删除临时文件
+                    if temp_path.exists():
+                        temp_path.unlink()
+
+                    # 保存分析结果
+                    image_analysis_results.append({
+                        'page': page_num + 1,
+                        'type': detected_type,
+                        'analysis': analysis_result.answer,
+                        'structured_info': analysis_result.extracted_info
+                    })
+
+                    logger.info(f"  ✓ 第 {page_num + 1} 页分析完成 (类型: {detected_type})")
+
+            doc.close()
+
+            # 格式化图片分析结果
+            if image_analysis_results:
+                formatted_results = "\n\n=== PDF图片页面分析 ===\n\n"
+                for result in image_analysis_results:
+                    formatted_results += f"【第{result['page']}页 - {result['type']}】\n"
+                    formatted_results += f"{result['analysis']}\n"
+                    if result['structured_info']:
+                        formatted_results += f"结构化信息: {result['structured_info']}\n"
+                    formatted_results += "\n"
+
+                logger.info(f"✓ PDF图片分析完成，共分析 {len(image_analysis_results)} 页")
+                return formatted_results
+            else:
+                logger.info("  未发现需要VLM分析的图片页面")
+                return ""
+
+        except Exception as e:
+            logger.error(f"  PDF图片分析失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return ""
+
+    async def handle_search(
+            self,
+            request: SearchRequest
+    ) -> SearchResponse:
+        """处理搜索请求"""
+        import time
+        start_time = time.time()
+
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"  处理搜索请求")
+        logger.info(f"  查询: {request.query}")
+        logger.info(f"  模型: {request.model}")
+        logger.info(f"  策略: {request.strategy}")
+        logger.info(f"  TopK: {request.topK}")
+        logger.info(f"  最小相似度: {request.minSimilarity}")
+        logger.info(f"{'=' * 60}")
+
+        # 执行向量检索 - 检索更多chunk以便聚合
+        vector_results = await self.vector_manager.search(
+            query=request.query,
+            top_k=request.topK * 3  # 检索3倍数量，用于聚合后筛选
+        )
+
+        # # 如果没有在本地向量数据库检索到任何内容
+        # if not vector_results:
+        #     msg = "检索未命中，本地数据库无结果。请尝试流式模式。"
+        #     return SearchResponse(
+        #         results=[],
+        #         totalCount=0,
+        #         queryTime=0,
+        #         model=request.model,
+        #         strategy=request.strategy
+        #     )
+            # async def event_generator():
+            #     # 1. 本地向量检索未命中
+            #     yield "data: 检索未命中，调用大模型...\n\n"
+            #
+            #     # 2. 调用LLM流式
+            #     from openai import OpenAI
+            #     client = OpenAI(
+            #         api_key=os.getenv("QWEN_API_KEY"),
+            #         base_url=os.getenv("QWEN_BASE_URL"),
+            #     )
+            #     with client.chat.completions.create(
+            #             model=os.getenv("QWEN_MULTIMODAL_MODAL_NAME"),
+            #             messages=[
+            #                 {"role": "system",
+            #                  "content": "你是一个专业的遥感领域知识与交叉学科专家，现在私有数据库中没有检索到相关信息，先和用户澄清这一点，然后接着澄清自己将通过自己的现有知识回答问题"},
+            #                 {"role": "user", "content": request.query}
+            #             ],
+            #             stream=True
+            #     ) as stream:
+            #         for chunk in stream:
+            #             delta = chunk.choices[0].delta.content
+            #             if delta:
+            #                 yield f"data: {delta}\n\n"
+            #
+            #     yield "data: 结束\n\n"
+            #
+            # return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+        # 【新增】按文件聚合结果
+        file_results = {}  # {file_id: {metadata, chunks, max_similarity}}
+
+        for result in vector_results:
+            metadata = result["metadata"]
+            file_id = metadata.get("file_id", "unknown")
+
+            if file_id not in file_results:
+                file_results[file_id] = {
+                    "metadata": metadata,
+                    "chunks": [],
+                    "max_similarity": result["similarity"]
+                }
+
+            file_results[file_id]["chunks"].append({
+                "content": result["content"],
+                "similarity": result["similarity"],
+                "chunk_id": metadata.get("chunk_id", 0)
+            })
+
+            # 更新最高相似度
+            if result["similarity"] > file_results[file_id]["max_similarity"]:
+                file_results[file_id]["max_similarity"] = result["similarity"]
+
+        # 【新增】按最高相似度排序文件
+        sorted_files = sorted(
+            file_results.items(),
+            key=lambda x: x[1]["max_similarity"],
+            reverse=True
+        )
+
+        # 【调试】打印相似度信息
+        if sorted_files:
+            logger.info(f"\n  相似度分布:")
+            for i, (file_id, file_data) in enumerate(sorted_files[:5], 1):  # 只显示前5个
+                logger.info(
+                    f"  [{i}] {file_data['metadata'].get('file_name', 'unknown')}: {file_data['max_similarity']:.6f}")
+
+        # 【新增】根据相似度阈值过滤
+        filtered_files = [
+            (file_id, file_data)
+            for file_id, file_data in sorted_files
+            if file_data["max_similarity"] >= request.minSimilarity
+        ]
+
+        # 【新增】只保留 topK 个文件
+        final_files = filtered_files[:request.topK]
+
+        logger.info(f"  原始检索: {len(vector_results)} 个chunk")
+        logger.info(f"  聚合去重: {len(sorted_files)} 个文件")
+        logger.info(f"  相似度过滤(>={request.minSimilarity}): {len(filtered_files)} 个文件")
+        logger.info(f"  最终返回(topK={request.topK}): {len(final_files)} 个文件")
+
+        # 格式化为前端需要的格式
+        search_results = []
+        for idx, (file_id, file_data) in enumerate(final_files):
+            metadata = file_data["metadata"]
+            chunks = file_data["chunks"]
+
+            # 确定文件类型
+            file_name = metadata.get("file_name", "")
+            image_type = metadata.get("image_type", "")
+
+            # 根据检测的图片类型设置显示类型
+            if image_type:
+                file_type_map = {
+                    ImageType.Classification: "遥感分类图",
+                    ImageType.Detection: "目标检测图",
+                    ImageType.Technology_map: "架构/技术路线图",
+                    ImageType.Technical_doc: "技术文档"
+                }
+                file_type = file_type_map.get(image_type, "图片")
+                thumbnail_type = "image"
+            elif file_name.lower().endswith('.pdf'):
+                file_type = "PDF"
+                thumbnail_type = "pdf"
+            elif any(ext in file_name.lower() for ext in ['.png', '.jpg', '.jpeg']):
+                file_type = "图片"
+                thumbnail_type = "image"
+            else:
+                file_type = "其他"
+                thumbnail_type = "image"
+
+            # 【新增】合并多个chunk的内容作为snippet
+            # 选择相似度最高的chunk作为主要snippet
+            best_chunk = max(chunks, key=lambda c: c["similarity"])
+            snippet = best_chunk["content"][:200]
+
+            # 如果有多个chunk，添加提示
+            if len(chunks) > 1:
+                snippet += f"... (共{len(chunks)}个相关片段)"
+
+            # 提取页码信息
+            page_info = metadata.get("page", "N/A")
+
+            search_result = SearchResult(
+                id=file_id,
+                fileName=file_name,
+                filePath=metadata.get("file_path", f"/files/{file_id}"),
+                fileType=file_type,
+                similarity=file_data["max_similarity"],
+                page=str(page_info) if page_info else None,
+                date=metadata.get("upload_date", datetime.now().isoformat())[:10],
+                snippet=snippet,
+                citationNumber=idx + 1,
+                thumbnailType=thumbnail_type,
+                thumbnailUrl=f"/api/thumbnail/{file_id}",
+                previewUrl=f"/api/preview/{file_id}",
+                version=metadata.get("version", "v1.0"),
+                structuredData=self._extract_structured_data(metadata)
+            )
+
+            search_results.append(search_result)
+
+        query_time = time.time() - start_time
+
+        print(f"\n✓ 搜索完成")
+        logger.info(f"  返回 {len(search_results)} 个文档")
+        logger.info(f"  耗时: {query_time:.2f}秒")
+
+        return SearchResponse(
+            results=search_results,
+            totalCount=len(search_results),
+            queryTime=round(query_time * 1000),  # 转换为毫秒
+            model=request.model,
+            strategy=request.strategy
+        )
+
+    async def handle_upload(
+            self,
+            file: UploadFile,
+            image_type: Optional[str] = None
+    ) -> UploadResponse:
+        """
+        处理文件上传
+
+        Args:
+            file: 上传的文件
+            image_type: 用户指定的图片类型（可选）
+                       支持: cad, floor_plan, architecture, technical_doc
+        """
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"  处理文件上传: {file.filename}")
+        if image_type:
+            logger.info(f"   用户指定类型: {image_type}")
+        logger.info(f"{'=' * 60}")
+
+        try:
+            # 生成文件ID
+            file_id = str(uuid.uuid4())
+            file_extension = Path(file.filename).suffix.lower()
+
+            # 保存上传的文件
+            file_path = self.load_dir / f"{file_id}{file_extension}"
+            content = await file.read()
+            with open(file_path, 'wb') as f:
+                f.write(content)
+
+            logger.info(f"  文件已保存: {file_path}")
+
+            detected_image_type = None  # 记录检测到的图片类型
+
+            # 根据文件类型处理
+            if file_extension == '.pdf':
+                # PDF 文件：使用快速模式提取
+                extraction_result = await self.pdf_service.extract_fast(
+                    str(file_path),
+                    original_filename=file.filename
+                )
+
+                content_text = extraction_result["markdown"]
+                file_type = "PDF"
+
+                # 提取页面信息
+                page_count = extraction_result["metadata"]["total_pages"]
+
+                # 生成PDF首页缩略图
+                self._generate_pdf_thumbnail(file_path, file_id)
+
+                # 【新增】分析PDF中的图片页面
+                pdf_image_analysis = await self._analyze_pdf_images(file_path, extraction_result)
+                if pdf_image_analysis:
+                    content_text += "\n\n" + pdf_image_analysis
+                    logger.info("  PDF图片页面已整合到内容中")
+
+            elif file_extension in ['.png', '.jpg', '.jpeg']:
+                # 【新增】智能检测图片类型
+                detected_image_type = await self._detect_image_type(file_path, image_type)
+
+                # 根据检测的类型生成合适的问题
+                question_map = {
+                    ImageType.Classification: "请详细描述这张分类图的内容，包括所有可见的分类对象、分类区域、分布情况等。",
+                    ImageType.Detection: "请详细描述这张目标检测图，包括目标框对象、目标框信息、使用场景等信息。",
+                    ImageType.Technology_map: "请详细描述这张架构图/流程图，包括所有组件、模块、关系和流程。",
+                    ImageType.Technical_doc: "请详细描述这份技术文档，包括所有可见的参数、表格数据、注意信息等。"
+                }
+
+                question = question_map.get(detected_image_type, "请详细描述这张图的所有内容。")
+
+                # 图像文件：使用 VLM 分析
+                analysis_result = await self.vlm_analyzer.analyze_image(
+                    str(file_path),
+                    question=question,
+                    image_type=detected_image_type
+                )
+
+                # 【优化】将结构化信息转换为自然语言
+                natural_language_info = self._format_extracted_info_to_natural_language(
+                    analysis_result.extracted_info
+                )
+                content_text = f"{analysis_result.answer}\n\n{natural_language_info}"
+
+                # 【新增】根据检测类型设置文件类型
+                file_type_map = {
+                    ImageType.Classification: "遥感分类图",
+                    ImageType.Detection: "目标检测图",
+                    ImageType.Technology_map: "架构/技术路线图",
+                    ImageType.Technical_doc: "技术文档"
+                }
+                file_type = file_type_map.get(detected_image_type, "图片")
+                page_count = 1
+
+            else:
+                raise HTTPException(status_code=400, detail=f"不支持的文件类型: {file_extension}")
+
+            # 添加到向量库
+            metadata = {
+                "file_path": str(file_path),
+                "file_extension": file_extension,
+                "page_count": page_count,
+                "version": "v1.0"
+            }
+
+            # 如果有检测到的图片类型，添加到元数据
+            if detected_image_type:
+                metadata["image_type"] = detected_image_type
+
+            # 【新增】如果有分析结果，存储结构化信息到元数据
+            if 'analysis_result' in locals():
+                # ⚠️ ChromaDB 不支持嵌套字典，需要序列化
+                # 将复杂的 extracted_info 转为 JSON 字符串
+                metadata["extracted_info_json"] = json.dumps(analysis_result.extracted_info, ensure_ascii=False)
+
+                # 【新增】提取关键字段到元数据顶层（便于过滤）
+                extracted_info = analysis_result.extracted_info
+                if "rooms" in extracted_info:
+                    metadata["room_count"] = len(extracted_info["rooms"])
+                    # 统计卧室数量
+                    bedrooms = [r for r in extracted_info["rooms"] if "卧" in r.get("name", "")]
+                    metadata["bedroom_count"] = len(bedrooms)
+
+                if "total_dimensions" in extracted_info:
+                    total_dims = extracted_info["total_dimensions"]
+                    metadata["total_area"] = float(total_dims.get("total_area", 0))
+                    metadata["total_length"] = float(total_dims.get("length", 0))
+                    metadata["total_width"] = float(total_dims.get("width", 0))
+
+            chunk_count = await self.vector_manager.add_document(
+                file_id=file_id,
+                file_name=file.filename,
+                file_type=file_type,
+                content=content_text,
+                metadata=metadata
+            )
+
+            print(f"\n  文件上传并索引完成")
+            logger.info(f"  文件ID: {file_id}")
+            logger.info(f"  文件类型: {file_type}")
+            if detected_image_type:
+                logger.info(f"  检测类型: {detected_image_type}")
+            logger.info(f"  分块数: {chunk_count}")
+
+            return UploadResponse(
+                success=True,
+                fileId=file_id,
+                fileName=file.filename,
+                message=f"文件上传成功，已分割为 {chunk_count} 个文本块并建立索引",
+                detectedImageType=detected_image_type
+            )
+
+        except Exception as e:
+            logger.error(f"  文件上传失败: {e}")
+            import traceback
+            traceback.print_exc()
+
+            return UploadResponse(
+                success=False,
+                fileId="",
+                fileName=file.filename,
+                message=f"  文件上传失败: {str(e)}"
+            )
+
+    async def handle_follow_up_question(
+            self,
+            request: FollowUpQuestionRequest
+    ) -> FollowUpQuestionResponse:
+        """处理追问"""
+
+        # 检索相关文档片段
+        results = await self.vector_manager.search(
+            query=request.question,
+            top_k=3
+        )
+
+        # 过滤出指定文档的结果
+        doc_results = [r for r in results if r["metadata"].get("file_id") == request.documentId]
+
+        if not doc_results:
+            # 如果没有找到指定文档，使用所有结果
+            doc_results = results
+
+        # 构建上下文
+        context = "\n\n".join([r["content"] for r in doc_results[:3]])
+
+        # 使用 LLM 生成回答
+        try:
+            from langchain_openai import ChatOpenAI
+
+            llm = ChatOpenAI(
+                model_name=self.infermodel_name,
+                api_key=self.infermodel_api_key,
+                base_url=self.model_url,
+                temperature=0.3
+            )
+
+            prompt = f"""
+                基于以下文档内容回答问题：
+    
+                文档内容：
+                {context}
+                
+                问题：{request.question}
+                
+                请给出准确、详细的回答，并指出回答依据的内容来自哪些部分。
+            """
+
+            response = await llm.ainvoke(prompt)
+            answer = response.content
+
+            # 提取引用
+            citations = [i + 1 for i in range(len(doc_results))]
+
+            logger.info(f"  回答生成完成")
+
+            return FollowUpQuestionResponse(
+                answer=answer,
+                citations=citations,
+                confidence=0.85
+            )
+
+        except Exception as e:
+            logger.error(f"  回答生成失败: {e}")
+            return FollowUpQuestionResponse(
+                answer="抱歉，无法生成回答。",
+                citations=[],
+                confidence=0.0
+            )
+
+    def _extract_structured_data(self, metadata: Dict[str, Any]) -> List[Dict[str, str]]:
+        """从元数据提取结构化数据"""
+        structured_data = []
+
+        if "page_count" in metadata:
+            structured_data.append({
+                "label": "页数",
+                "value": str(metadata["page_count"])
+            })
+
+        if "version" in metadata:
+            structured_data.append({
+                "label": "版本",
+                "value": metadata["version"]
+            })
+
+        if "upload_date" in metadata:
+            structured_data.append({
+                "label": "上传日期",
+                "value": metadata["upload_date"][:10]
+            })
+
+        return structured_data
+
+    async def handle_intelligent_qa(
+            self,
+            request: IntelligentQARequest
+    ) -> IntelligentQAResponse:
+        """
+        智能问答 - 直接回答用户问题
+
+        根据问题类型选择不同的处理策略：
+        1. 精确查询：从元数据直接提取答案（如："有几个卧室"）
+        2. 过滤查询：先过滤再检索（如："找3个卧室的户型"）
+        3. 一般查询：向量检索 + LLM生成答案
+        """
+        logger.info(f"\n{'=' * 60}")
+        logger.info(f"  智能问答")
+        logger.info(f"  问题: {request.question}")
+        logger.info(f"{'=' * 60}")
+
+        # 1. 分类问题类型
+        query_type = self._classify_question(request.question)
+        logger.info(f"  问题类型: {query_type}")
+
+        answer, sources, confidence = await self._handle_general_query(request.question, request.top_k)
+
+        logger.info(f"✓ 答案已生成")
+        logger.info(f"  置信度: {confidence:.2f}")
+        logger.info(f"  来源数: {len(sources)}")
+
+        return IntelligentQAResponse(
+            answer=answer,
+            sources=sources,
+            confidence=confidence,
+            query_type=query_type
+        )
+
+    def _classify_question(self, question: str) -> str:
+        """分类问题类型"""
+        question_lower = question.lower()
+
+        # 精确查询关键词
+        exact_keywords = [""] # 这里未开启精确查询
+        # exact_keywords = ["几个", "多少个", "有多少", "面积", "尺寸", "长度", "宽度", "多大", "多长"]
+        if any(kw in question for kw in exact_keywords):
+            return "exact_query"
+
+        # 过滤查询关键词
+        filter_keywords = [""] # 不进行过滤查找
+        # filter_keywords = ["找", "查找", "筛选", "符合", "满足", "大于", "小于", "至少"]
+        if any(kw in question for kw in filter_keywords):
+            return "filter_query"
+
+        return "general_query"
+
+
+    async def _handle_general_query(
+            self,
+            question: str,
+            top_k: int
+    ) -> tuple[str, List[Dict[str, Any]], float]:
+        """处理一般查询 - 向量检索 + LLM"""
+
+        # 向量检索
+        vector_results = await self.vector_manager.search(
+            query=question,
+            top_k=top_k
+        )
+
+    # if not vector_results:
+    #         return "抱歉，没有找到相关信息。", [], 0.0
+
+        # 构建上下文
+        context_parts = []
+        for i, result in enumerate(vector_results, 1):
+            metadata = result["metadata"]
+            context_parts.append(f"[文档{i}] {metadata.get('file_name')}:")
+            context_parts.append(result["content"][:500])
+            context_parts.append("")
+
+        context = "\n".join(context_parts)
+
+        # 使用 LLM 生成答案（如果配置了）
+        if self.infermodel_api_key:
+            try:
+                from langchain_openai import ChatOpenAI
+
+                llm = ChatOpenAI(
+                    model_name=self.infermodel_name,
+                    api_key=self.infermodel_api_key,
+                    base_url=self.model_url,
+                    temperature=0.3
+                )
+
+                prompt = f"""基于以下文档内容回答问题。
+
+                    文档内容：
+                    {context}
+                    
+                    问题：{question}
+                    
+                    请给出准确、详细的回答。
+                """
+
+                response = await llm.ainvoke(prompt)
+                answer = response.content
+
+                # 添加来源
+                sources_text = "\n\n📄 参考来源：\n"
+                for i, result in enumerate(vector_results, 1):
+                    sources_text += f"{i}. {result['metadata'].get('file_name')}\n"
+
+                answer += sources_text
+
+            except Exception as e:
+                logger.error(f"LLM生成答案失败: {e}")
+                answer = f"根据检索到的内容：\n\n{vector_results[0]['content'][:500]}\n\n来源：{vector_results[0]['metadata'].get('file_name')}"
+        else:
+            # 没有配置LLM，返回最相关的内容
+            answer = f"根据检索到的内容：\n\n{vector_results[0]['content'][:500]}\n\n来源：{vector_results[0]['metadata'].get('file_name')}"
+
+        # 构建来源信息
+        sources = [{
+            "file_id": r["metadata"].get("file_id"),
+            "file_name": r["metadata"].get("file_name"),
+            "file_type": r["metadata"].get("file_type"),
+            "similarity": r["similarity"]
+        } for r in vector_results]
+
+        confidence = vector_results[0]["similarity"]
+
+        return answer, sources, confidence
+
+
+"-----------------请求日志中间件--------------"
+class RequestLoggerMiddleware(BaseHTTPMiddleware):
+    """记录所有API请求的中间件"""
+
+    async def dispatch(self, request: Request, call_next):
+        # 记录请求信息
+        request_id = str(uuid.uuid4())[:8]
+        start_time = time.time()
+
+        # 获取客户端信息
+        client_host = request.client.host if request.client else "unknown"
+
+        # 记录请求开始
+        logger.info(f"")
+        logger.info(f"{'=' * 80}")
+        logger.info(f"[{request_id}]   收到请求")
+        logger.info(f"[{request_id}]   方法: {request.method}")
+        logger.info(f"[{request_id}]   路径: {request.url.path}")
+        logger.info(f"[{request_id}]   客户端: {client_host}")
+        logger.info(f"[{request_id}]   User-Agent: {request.headers.get('user-agent', 'N/A')}")
+
+        # 如果是 POST 请求，记录 Content-Type
+        if request.method == "POST":
+            content_type = request.headers.get('content-type', 'N/A')
+            logger.info(f"[{request_id}]   Content-Type: {content_type}")
+
+        logger.info(f"{'=' * 80}")
+
+        # 处理请求
+        try:
+            response = await call_next(request)
+
+            # 计算耗时
+            process_time = time.time() - start_time
+
+            # 记录响应
+            logger.info(f"")
+            logger.info(f"{'=' * 80}")
+            logger.info(f"[{request_id}]   返回响应")
+            logger.info(f"[{request_id}]   状态码: {response.status_code}")
+            logger.info(f"[{request_id}]   耗时: {process_time:.3f}秒")
+            logger.info(f"{'=' * 80}")
+            logger.info(f"")
+
+            # 添加响应头
+            response.headers["X-Request-ID"] = request_id
+            response.headers["X-Process-Time"] = f"{process_time:.3f}"
+
+            return response
+
+        except Exception as e:
+            # 记录错误
+            process_time = time.time() - start_time
+            logger.error(f"")
+            logger.error(f"{'=' * 80}")
+            logger.error(f"[{request_id}]   请求处理失败")
+            logger.error(f"[{request_id}]   错误: {str(e)}")
+            logger.error(f"[{request_id}]   耗时: {process_time:.3f}秒")
+            logger.error(f"{'=' * 80}")
+            logger.error(f"", exc_info=True)
+            raise
+
+
+
+"-------------FastAPI 应用----------------"
+
+app = FastAPI(
+    title="多模态 RAG API",
+    description="面向遥感处理可视化的多模态(PDF/图片/文本)文档检索与问答系统",
+    version="1.0.0"
+)
+
+# 添加请求日志中间件
+app.add_middleware(RequestLoggerMiddleware)
+
+# CORS 配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 生产环境应该限制具体域名
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 初始化服务
+service = MultiModalRAGService()
+
+@app.get("/")
+async def root():
+    """根路径"""
+    return {
+        "service": "多模态 RAG API",
+        "version": "1.0.0",
+        "status": "running"
+    }
+
+@app.get("/health")
+async def health_check():
+    """健康检查"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.post("/search", response_model=SearchResponse)
+async def search(request: SearchRequest):
+    """搜索接口"""
+    try:
+        log_request(f"\n{'=' * 80}")
+        log_request(f"  API收到搜索请求")
+        log_request(f"  查询: {request.query}")
+        log_request(f"  模型: {request.model}")
+        log_request(f"  策略: {request.strategy}")
+        log_request(f"  TopK: {request.topK}")
+        print(f"{'=' * 80}\n")
+        sys.stdout.flush()
+
+        result = await service.handle_search(request)
+
+        if type(result) is  StreamingResponse:
+            return result
+
+        log_request(f"\n{'=' * 80}")
+        log_request(f"  API搜索完成，返回 {result.totalCount} 个结果")
+        print(f"{'=' * 80}\n")
+        sys.stdout.flush()
+
+        return result
+    except Exception as e:
+        print(f"\n  搜索失败: {e}\n")
+        sys.stdout.flush()
+        logger.error(f"  搜索失败: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# @app.get("/search_stream")
+# async def search_stream(query: str):
+#     """用于 EventSource 的流式接口"""
+#     async def event_generator():
+#         yield "data: 检索未命中，调用大模型...\n\n"
+#
+#         from openai import OpenAI
+#         import os
+#
+#         client = OpenAI(
+#             api_key=os.getenv("QWEN_API_KEY"),
+#             base_url=os.getenv("QWEN_BASE_URL"),
+#         )
+#
+#         with client.chat.completions.create(
+#                 model=os.getenv("QWEN_MULTIMODAL_MODAL_NAME"),
+#                 messages=[
+#                     {"role": "system", "content": "你是遥感领域专家..."},
+#                     {"role": "user", "content": query}
+#                 ],
+#                 stream=True
+#             ) as stream:
+#             for chunk in stream:
+#                 delta = chunk.choices[0].delta.content
+#                 if delta:
+#                     yield f"data: {delta}\n\n"
+#
+#         yield "data: 结束\n\n"
+#
+#     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+@app.post("/upload", response_model=UploadResponse)
+async def upload(
+        file: UploadFile = File(...),
+        image_type: Optional[str] = None):
+    """
+    文件上传接口
+
+    Args:
+        file: 上传的文件
+        image_type: 可选的图片类型指定
+                   支持: cad, floor_plan, architecture, technical_doc
+    """
+    try:
+        log_request(f"\n{'=' * 80}")
+        log_request(f"  API收到文件上传请求")
+        log_request(f"  文件名: {file.filename}")
+        log_request(f"  Content-Type: {file.content_type}")
+        if image_type:
+            log_request(f"  指定类型: {image_type}")
+        print(f"{'=' * 80}\n")
+        sys.stdout.flush()
+
+        result = await service.handle_upload(file, image_type)
+
+        log_request(f"\n{'=' * 80}")
+        print(f"{'✓' if result.success else '❌'} 文件上传{'成功' if result.success else '失败'}")
+        log_request(f"  消息: {result.message}")
+        if result.detectedImageType:
+            log_request(f"  检测类型: {result.detectedImageType}")
+        print(f"{'=' * 80}\n")
+        sys.stdout.flush()
+
+        return result
+    except Exception as e:
+        print(f"\n❌ 上传失败: {e}\n")
+        sys.stdout.flush()
+        logger.error(f"❌ 上传失败: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/question", response_model=FollowUpQuestionResponse)
+async def follow_up_question(request: FollowUpQuestionRequest):
+    """追问接口"""
+    try:
+        return await service.handle_follow_up_question(request)
+    except Exception as e:
+        logger.error(f"❌ 追问失败: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/ask", response_model=IntelligentQAResponse)
+async def intelligent_qa(request: IntelligentQARequest):
+    """
+    智能问答接口 - 直接回答用户问题
+
+    支持三种查询类型：
+    1. 精确查询：从元数据直接提取答案（如："有几个卧室？"）
+    2. 过滤查询：智能过滤 + 检索（如："找3个卧室的户型"）
+    3. 一般查询：向量检索 + LLM生成答案
+    """
+    try:
+        log_request(f"\n{'=' * 80}")
+        log_request(f"🤖 API收到智能问答请求")
+        log_request(f"  问题: {request.question}")
+        log_request(f"  TopK: {request.top_k}")
+        print(f"{'=' * 80}\n")
+        sys.stdout.flush()
+
+        result = await service.handle_intelligent_qa(request)
+
+        log_request(f"\n{'=' * 80}")
+        log_request(f"✓ 答案已生成")
+        log_request(f"  问题类型: {result.query_type}")
+        log_request(f"  置信度: {result.confidence:.2f}")
+        log_request(f"  来源数: {len(result.sources)}")
+        print(f"{'=' * 80}\n")
+        sys.stdout.flush()
+
+        return result
+    except Exception as e:
+        print(f"\n❌ 智能问答失败: {e}\n")
+        sys.stdout.flush()
+        logger.error(f"❌ 智能问答失败: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/preview/{file_id}")
+async def get_preview(file_id: str):
+    """获取文档预览"""
+    # 预览和缩略图暂时一样，返回原图
+    return await get_thumbnail(file_id)
+
+@app.get("/thumbnail/{file_id}")
+async def get_thumbnail(file_id: str):
+    """获取文档缩略图"""
+    try:
+        # 查找文件
+        for ext in ['.png', '.jpg', '.jpeg', '.pdf']:
+            file_path = service.load_dir / f"{file_id}{ext}"
+            if file_path.exists():
+                # 对于图片，直接返回原图
+                if ext in ['.png', '.jpg', '.jpeg']:
+                    return FileResponse(file_path, media_type=f"image/{ext[1:]}")
+                # 对于PDF，返回缩略图
+                elif ext == '.pdf':
+                    thumbnail_path = service.preview_dir / f"{file_id}_thumb.png"
+                    if thumbnail_path.exists():
+                        return FileResponse(thumbnail_path, media_type="image/png")
+                    else:
+                        # 如果缩略图不存在，尝试生成
+                        thumb_path = service._generate_pdf_thumbnail(file_path, file_id)
+                        if thumb_path and thumb_path.exists():
+                            return FileResponse(thumb_path, media_type="image/png")
+                        else:
+                            raise HTTPException(status_code=500, detail="PDF缩略图生成失败")
+                else:
+                    raise HTTPException(status_code=501, detail="该文件类型暂不支持缩略图")
+
+        raise HTTPException(status_code=404, detail=f"文件不存在: {file_id}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取缩略图失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/download/{document_id}")
+async def download_document(document_id: str):
+    """下载文档"""
+    # TODO: 实现文档下载
+    raise HTTPException(status_code=501, detail="下载功能暂未实现")
+
+# ============ 启动服务 ============
+
+if __name__ == "__main__":
+    print("\n" + "=" * 60)
+    print("🚀 启动多模态 RAG 服务")
+    print("=" * 60 + "\n")
+
+    # 配置 uvicorn 日志
+    log_config = uvicorn.config.LOGGING_CONFIG
+    log_config["formatters"]["default"]["fmt"] = "%(message)s"
+    log_config["formatters"]["access"]["fmt"] = '%(client_addr)s - "%(request_line)s" %(status_code)s'
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info",
+        log_config=log_config,
+        access_log=True
+    )

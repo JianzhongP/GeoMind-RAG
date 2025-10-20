@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/MuyuWorkSpace/01_TrafficProject/pc_multimodal_rag/**)",
+      "Bash(npm install)",
+      "Bash(tree:*)",
+      "Bash(rm:*)",
+      "Bash(test:*)",
+      "Bash(npm run dev)",
+      "Bash(npm cache clean:*)",
+      "Bash(npm install:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
