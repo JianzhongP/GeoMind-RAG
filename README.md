@@ -12,7 +12,7 @@ VLM-Based Multimodal RAG Remote Sensing Knowledge Question-Answering System
 
 ## Start:  
 在此之前，你需要通过以下命令安装本项目的支持包：(注意需要先 cd 到指定目录)
-~pip install requestment.txt~  
+~pip install requestment.txt  
 
 进入“./backend”文件夹，打开 main_service.py 脚本，并执行。需要注意的是，在此之前，你需要先通过 阿里的百炼平台 获取**API_KEY**和**BASE_URL**。运行后，会得到如下的提示：  
 <img width="1920" height="1020" alt="image" src="https://github.com/user-attachments/assets/6f43fa2a-2325-47e5-8fbd-3fb01951864f" />  
