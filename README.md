@@ -1,6 +1,6 @@
 # GeoMind-RAG
 ### VLM-Based Multimodal RAG Remote Sensing Knowledge Question-Answering System  
-这是一个针对遥感检测结果、文档、技术路线等私域知识的多模态RAG问答系统，LLM采用的是**qwen-vl-plus**，embedding model采用的是通义千问的**text-embedding-v4**。其他的自行添加即可。  
+这是一个针对遥感检测结果、文档、技术路线等私域知识的多模态RAG问答系统，LLM采用的是**qwen-vl-plus**，embedding model采用的是通义千问的**text-embedding-v4**。其他的自行添加即可。项目具体代码参见 ./master 目录。
 
 ## Start:  
 ### 后端：  
