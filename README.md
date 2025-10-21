@@ -24,4 +24,5 @@
 ## 功能预览：  
 <img width="1920" height="984" alt="image" src="https://github.com/user-attachments/assets/c6dfb997-66a4-4bcc-8e15-ae58fc371ac2" />  
 <img width="1920" height="988" alt="image" src="https://github.com/user-attachments/assets/16e0d314-8721-4de3-881e-e9db7e72b9ff" />  
+
 **这里设计的预览窗口是可拉伸的。** 
